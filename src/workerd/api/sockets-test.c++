@@ -5,6 +5,7 @@
 #include <workerd/io/io-context.h>
 #include <workerd/io/worker-interface.h>
 #include <workerd/io/worker.h>
+#include <workerd/jsg/script.h>
 #include <workerd/tests/test-fixture.h>
 
 #include <capnp/message.h>
@@ -95,6 +96,8 @@ kj::Promise<size_t> turnTimeout(int n) {
 }
 
 struct AsyncSendState {
+  // When set, the channel reports EOF instead of waiting for a datagram.
+  bool ended = false;
   bool called = false;
   bool closed = false;
   uint sent = 0;
@@ -110,6 +113,10 @@ class AsyncObservingDatagramChannel final: public DatagramChannel {
   }
 
   kj::Promise<kj::Maybe<kj::Array<kj::byte>>> receive() override {
+    if (KJ_REQUIRE_NONNULL(state.tryGet(), "test state destroyed").ended) {
+      return kj::Maybe<kj::Array<kj::byte>>(kj::none);
+    }
+
     return kj::Promise<kj::Maybe<kj::Array<kj::byte>>>(kj::NEVER_DONE);
   }
 
@@ -214,6 +221,39 @@ KJ_TEST("Outbound UDP RPC receive observes reverse capability release and orderl
       KJ_EXPECT_THROW_MESSAGE("UDP RPC session disconnected", channel->receive().wait(waitScope));
     }
   }
+}
+
+class EndRecordingUdpStream final: public rpc::DatagramStream::Server {
+ public:
+  explicit EndRecordingUdpStream(bool& ended): ended(ended) {}
+
+ private:
+  kj::Promise<void> end(EndContext context) override {
+    ended = true;
+    return kj::READY_NOW;
+  }
+
+  bool& ended;
+};
+
+KJ_TEST("Outbound UDP RPC end() ends only the outgoing direction") {
+  kj::EventLoop loop;
+  kj::WaitScope waitScope(loop);
+  bool ended = false;
+  rpc::DatagramStream::Client stream = kj::heap<EndRecordingUdpStream>(ended);
+  auto server = kj::heap<UdpSendTestDispatcher>(kj::mv(stream));
+  auto& serverRef = *server;
+  rpc::EventDispatcher::Client dispatcher(kj::mv(server));
+  auto channel = openTestUdpChannel(dispatcher, waitScope);
+
+  channel->end().wait(waitScope);
+  KJ_EXPECT(ended);
+
+  auto received = channel->receive().eagerlyEvaluate(nullptr);
+  auto reply = serverRef.received.sendRequest();
+  reply.setDatagram("reply"_kjb);
+  reply.send().wait(waitScope);
+  KJ_EXPECT(KJ_ASSERT_NONNULL(received.wait(waitScope)).asPtr() == "reply"_kjb);
 }
 
 KJ_TEST("Outbound UDP RPC transport loss rejects a pending receive without a send") {
@@ -333,6 +373,48 @@ KJ_TEST("UDP socket close waits for an already queued writable close") {
     KJ_EXPECT(state->sent == 2, tsStreams);
     KJ_EXPECT(state->observed.asPtr() == "second"_kjb, tsStreams);
     KJ_EXPECT(state->closed, tsStreams);
+  }
+}
+
+KJ_TEST("UDP socket resolves closed and closes its writable when the readable ends") {
+  for (bool tsStreams: {false, true}) {
+    capnp::MallocMessageBuilder flagsMessage;
+    auto flags = flagsMessage.initRoot<CompatibilityFlags>();
+    flags.setStreamsJavaScriptControllers(true);
+    flags.setOutboundUdpSockets(true);
+    flags.setTypeScriptImplementedStreams(tsStreams);
+    TestFixture fixture(TestFixture::SetupParams{.featureFlags = flags.asReader()});
+    kj::Pin<AsyncSendState> state;
+    state->ended = true;
+    kj::String result;
+
+    fixture.runInIoContext([&](const TestFixture::Environment& env) -> kj::Promise<void> {
+      auto& js = env.js;
+      auto socket = setupDatagramSocket(
+          js, kj::heap<AsyncObservingDatagramChannel>(state.addWeak()), kj::none, kj::none);
+      auto& handler = KJ_ASSERT_NONNULL(js.tryGetTypeHandler<jsg::Ref<Socket>>());
+      auto fn = KJ_ASSERT_NONNULL(jsg::NonModuleScript::compile(js, R"((async (socket) => {
+        const { done } = await socket.readable.getReader().read();
+        await socket.closed;
+        const writer = socket.writable.getWriter();
+        const write = await writer.write(new Uint8Array(1)).then(() => 'written', (e) => e.name);
+        return `${done},${write}`;
+      }))"_kj,
+          "udp-eof-test.js"_kj)
+                                      .runAndReturn(js)
+                                      .tryCast<jsg::JsFunction>());
+      auto promise = fn.call(js, js.undefined(), jsg::JsValue(handler.wrap(js, kj::mv(socket))));
+      auto script = env.context.awaitJs(
+          js, js.toPromise(promise).then(js, [&result](jsg::Lock& js, jsg::Value value) {
+        result = jsg::JsValue(value.getHandle(js)).toString(js);
+      }));
+
+      // A `closed` that never resolves leaves `result` empty instead of hanging the test.
+      return script.exclusiveJoin(turnTimeout(10000).ignoreResult());
+    });
+
+    KJ_EXPECT(result == "true,TypeError", result, tsStreams);
+    KJ_EXPECT(state->sent == 0, tsStreams);
   }
 }
 

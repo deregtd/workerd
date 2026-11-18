@@ -432,12 +432,25 @@ DisconnectWatcher watchForDisconnect(kj::AsyncIoStream& connection) {
 // call and enqueues exactly what came back as one packet value. Uses
 // JsReadableStream::fromPull() rather than create(), since create() requires a byte-oriented
 // ReadableStreamSource.
-JsReadableStream newDatagramReadableStream(jsg::Lock& js, IoOwn<DatagramChannel> channel) {
+// Value streams do not report EOF through onEof(), so `eof` is fulfilled here instead.
+JsReadableStream newDatagramReadableStream(
+    jsg::Lock& js, IoOwn<DatagramChannel> channel, kj::Own<kj::PromiseFulfiller<void>> eof) {
+  auto& context = IoContext::current();
   return JsReadableStream::fromPull(js,
-      [channel = kj::mv(channel)](jsg::Lock& js) mutable -> jsg::Promise<kj::Maybe<jsg::Value>> {
+      [channel = kj::mv(channel), eof = context.addObject(kj::refcountedWrapper(kj::mv(eof)))](
+          jsg::Lock& js) mutable -> jsg::Promise<kj::Maybe<jsg::Value>> {
     auto& ioContext = IoContext::current();
     IoContext::AwaitIoOperation traceOperation(ioContext, "datagram_receive"_kj);
-    return ioContext.awaitIo(js, channel->receive(),
+    auto received = channel->receive().then(
+        [signal = kj::addRef(*eof)](kj::Maybe<kj::Array<kj::byte>> datagram) mutable {
+      if (datagram == kj::none) {
+        signal->getWrapped().fulfill();
+      }
+
+      return kj::mv(datagram);
+    });
+
+    return ioContext.awaitIo(js, kj::mv(received),
         [](jsg::Lock& js, kj::Maybe<kj::Array<kj::byte>> datagram) -> kj::Maybe<jsg::Value> {
       KJ_IF_SOME(bytes, datagram) {
         auto data = jsg::JsUint8Array::create(js, bytes.asPtr());
@@ -456,16 +469,33 @@ JsReadableStream newDatagramReadableStream(jsg::Lock& js, IoOwn<DatagramChannel>
 // Unlike a byte-stream sink, chunks are never merged or split: each write() call becomes exactly
 // one DatagramChannel::send() call. The new experiment accepts ArrayBufferView values; the older
 // ingress experiment accepts Datagram instances.
-JsWritableStream newDatagramWritableStream(jsg::Lock& js, IoOwn<kj::Rc<DatagramChannel>> channel) {
+JsWritableStream newDatagramWritableStream(
+    jsg::Lock& js, IoOwn<kj::Rc<DatagramChannel>> channel, ContainerUdpPort containerUdpPort) {
+  kj::Maybe<kj::Function<jsg::Promise<void>(jsg::Lock&)>> close;
+  if (containerUdpPort) {
+    close = kj::Function<jsg::Promise<void>(jsg::Lock&)>(
+        [channel = IoContext::current().addObject(kj::heap(channel->addRef()))](
+            jsg::Lock& js) mutable {
+      auto native = channel->addRef();
+      return IoContext::current().awaitIo(js, native->end().attach(kj::mv(native)));
+    });
+  }
+
   return JsWritableStream::fromWrite(js,
-      [channel = kj::mv(channel)](jsg::Lock& js, jsg::JsValue chunk) mutable -> jsg::Promise<void> {
+      [channel = kj::mv(channel), containerUdpPort](
+          jsg::Lock& js, jsg::JsValue chunk) mutable -> jsg::Promise<void> {
     // Copy under the isolate lock. The send may outlive the JS buffer or its backing store.
     auto bytes = [&]() {
       if (FeatureFlags::get(js).getOutboundUdpSockets()) {
         const auto data = JSG_REQUIRE_NONNULL(chunk.tryCast<jsg::JsArrayBufferView>(), TypeError,
             "This socket's writable stream only accepts ArrayBufferView values (TypedArray or DataView).");
-        JSG_REQUIRE(
-            data.asArrayPtr().size() <= 65507, RangeError, "UDP payload exceeds 65507 bytes.");
+        if (containerUdpPort) {
+          JSG_REQUIRE(data.asArrayPtr().size() <= 1500, RangeError,
+              "UDP payload exceeds the 1500-byte limit.");
+        } else {
+          JSG_REQUIRE(
+              data.asArrayPtr().size() <= 65507, RangeError, "UDP payload exceeds 65507 bytes.");
+        }
         return kj::heapArray<kj::byte>(data.asArrayPtr());
       }
       auto& handler = KJ_ASSERT_NONNULL(js.tryGetTypeHandler<jsg::Ref<Datagram>>());
@@ -486,7 +516,8 @@ JsWritableStream newDatagramWritableStream(jsg::Lock& js, IoOwn<kj::Rc<DatagramC
     }
     IoContext::AwaitIoOperation traceOperation(ioContext, "datagram_send"_kj);
     return ioContext.awaitIo(js, kj::mv(sendPromise));
-  });
+  },
+      kj::mv(close));
 }
 
 // Reads and writes can be issued immediately, but cannot reach the channel until the routed
@@ -503,6 +534,9 @@ class PromisedDatagramChannel final: public DatagramChannel {
   kj::Promise<void> send(kj::ArrayPtr<const kj::byte> bytes) override {
     return canceler.wrap(sendImpl(bytes));
   }
+  kj::Promise<void> end() override {
+    return canceler.wrap(endImpl());
+  }
 
   void close() override {
     canceler.cancel("UDP socket closed");
@@ -517,6 +551,10 @@ class PromisedDatagramChannel final: public DatagramChannel {
   kj::Promise<void> sendImpl(kj::ArrayPtr<const kj::byte> bytes) {
     auto connected = co_await channel.addBranch();
     co_await connected->send(bytes);
+  }
+  kj::Promise<void> endImpl() {
+    auto connected = co_await channel.addBranch();
+    co_await connected->end();
   }
 
   kj::ForkedPromise<kj::Rc<DatagramChannel>> channel;
@@ -569,6 +607,14 @@ class RpcDatagramChannel final: public DatagramChannel, public kj::Refcounted {
     auto req = down.sendRequest(capnp::MessageSize{8 + datagram.size() / sizeof(capnp::word), 0});
     req.setDatagram(datagram);
     return req.send();
+  }
+
+  // Ends the outgoing datagram stream. Incoming datagrams keep arriving.
+  kj::Promise<void> end() override {
+    KJ_IF_SOME(exception, failure) {
+      return exception.clone();
+    }
+    return endOutgoing();
   }
 
   // Delivers one incoming RPC datagram with consumption backpressure.
@@ -890,7 +936,8 @@ jsg::Ref<Socket> setupDatagramSocket(jsg::Lock& js,
     kj::Own<DatagramChannel> channelOwn,
     kj::Maybe<kj::String> remoteAddress,
     kj::Maybe<kj::String> localAddress,
-    kj::Promise<kj::Maybe<kj::Exception>> status) {
+    kj::Promise<kj::Maybe<kj::Exception>> status,
+    ContainerUdpPort containerUdpPort) {
   auto& ioContext = IoContext::current();
 
   kj::Rc<DatagramChannel> channel(kj::mv(channelOwn));
@@ -898,15 +945,16 @@ jsg::Ref<Socket> setupDatagramSocket(jsg::Lock& js,
   auto closedPrPair = js.newPromiseAndResolver<void>();
   closedPrPair.promise.markAsHandled(js);
 
-  JsReadableStream readable(newDatagramReadableStream(js, ioContext.addObject(channel.addRef())));
   // UDP sockets have no allowHalfOpen option: `closed` always resolves from read-EOF once the
   // flow ends, mirroring the allowHalfOpen == false behavior for TCP sockets below.
-  auto eofPromise = readable.onEof(js);
+  auto eof = kj::newPromiseAndFulfiller<void>();
+  JsReadableStream readable(
+      newDatagramReadableStream(js, ioContext.addObject(channel.addRef()), kj::mv(eof.fulfiller)));
 
   auto openedPrPair = js.newPromiseAndResolver<SocketInfo>();
   openedPrPair.promise.markAsHandled(js);
-  auto writable = newDatagramWritableStream(
-      js, ioContext.addObject(kj::heap<kj::Rc<DatagramChannel>>(channel.addRef())));
+  auto writable = newDatagramWritableStream(js,
+      ioContext.addObject(kj::heap<kj::Rc<DatagramChannel>>(channel.addRef())), containerUdpPort);
 
   auto result = js.alloc<Socket>(js, ioContext, kj::mv(channel), kj::mv(remoteAddress),
       kj::mv(localAddress), kj::mv(readable), kj::mv(writable), kj::mv(closedPrPair),
@@ -917,11 +965,20 @@ jsg::Ref<Socket> setupDatagramSocket(jsg::Lock& js,
       SecureTransportKind::OFF, SocketProtocol::UDP, kj::none /* domain */,
       false /* isDefaultFetchPort */, kj::mv(openedPrPair));
 
-  result->handleReadableEof(js, kj::mv(eofPromise));
+  result->handleDatagramEof(js, kj::mv(eof.promise));
   // Ingress flows are already open. Outbound flows resolve only after routing and policy setup.
-  result->handleProxyStatus(js, kj::mv(status));
+  result->handleProxyStatus(js, kj::mv(status), containerUdpPort);
   result->trackOpenedState(js);
   return result;
+}
+
+kj::Own<DatagramChannel> newRpcDatagramChannel(
+    kj::FunctionParam<rpc::DatagramStream::Client(rpc::DatagramStream::Client down)> connect) {
+  auto up = kj::newPromiseAndFulfiller<rpc::DatagramStream::Client>();
+  auto channel = kj::rc<RpcDatagramChannel>(
+      rpc::DatagramStream::Client(kj::mv(up.promise)), RpcDatagramChannel::SendMode::STREAMING);
+  up.fulfiller->fulfill(connect(kj::heap<IncomingRpcDatagramStream>(channel.downgrade())));
+  return channel.toOwn();
 }
 
 kj::Promise<WorkerInterface::CustomEvent::Result> UdpEgressCustomEvent::complete(
@@ -1152,12 +1209,19 @@ jsg::Ref<Socket> connectImpl(jsg::Lock& js,
 
   auto& ioContext = IoContext::current();
 
-  bool udp = false;
+  bool containerUdpPort = false;
+  KJ_IF_SOME(f, fetcher) {
+    containerUdpPort = f->isContainerUdpPort();
+  }
+
+  bool udp = containerUdpPort;
   KJ_IF_SOME(opts, options) {
     if (FeatureFlags::get(js).getOutboundUdpSockets()) {
       KJ_IF_SOME(protocol, opts.protocol) {
         JSG_REQUIRE(protocol == "tcp" || protocol == "udp", TypeError,
             "Socket protocol must be 'tcp' or 'udp'.");
+        JSG_REQUIRE(
+            !containerUdpPort || protocol == "udp", TypeError, "This port only supports UDP.");
         udp = protocol == "udp";
       }
     }
@@ -1259,7 +1323,7 @@ jsg::Ref<Socket> connectImpl(jsg::Lock& js,
     auto channel = opened.promise.then(
         [owner = kj::mv(owner)](auto channel) mutable { return channel.attach(kj::mv(owner)); });
     return setupDatagramSocket(js, kj::heap<PromisedDatagramChannel>(kj::mv(channel)),
-        kj::mv(addressStr), kj::none, kj::mv(status));
+        kj::mv(addressStr), kj::none, kj::mv(status), ContainerUdpPort(containerUdpPort));
   }
 
   // Set up the connection.
@@ -1736,7 +1800,9 @@ void Socket::handleProxyStatus(
   result.markAsHandled(js);
 }
 
-void Socket::handleProxyStatus(jsg::Lock& js, kj::Promise<kj::Maybe<kj::Exception>> connectResult) {
+void Socket::handleProxyStatus(jsg::Lock& js,
+    kj::Promise<kj::Maybe<kj::Exception>> connectResult,
+    ContainerUdpPort containerUdpPort) {
   // It's kind of weird to take a promise that resolves to a Maybe<Exception> but we can't just use
   // a Promise<void> and put our logic in the error handler because awaitIo doesn't provide the
   // jsg::Lock for void promises or to errorFunc implementations, only non-void success callbacks,
@@ -1750,10 +1816,15 @@ void Socket::handleProxyStatus(jsg::Lock& js, kj::Promise<kj::Maybe<kj::Exceptio
     }
     return kj::mv(e);
   };
-  auto func = [self = JSG_THIS](jsg::Lock& js, kj::Maybe<kj::Exception> result) mutable -> void {
+  auto func = [self = JSG_THIS, containerUdpPort](
+                  jsg::Lock& js, kj::Maybe<kj::Exception> result) mutable -> void {
     KJ_IF_SOME(e, result) {
       self->connectErrno = connectErrnoName(e);
-      self->handleProxyError(js, JSG_KJ_EXCEPTION(FAILED, Error, "connection attempt failed"));
+      if (containerUdpPort) {
+        self->handleProxyError(js, kj::mv(e));
+      } else {
+        self->handleProxyError(js, JSG_KJ_EXCEPTION(FAILED, Error, "connection attempt failed"));
+      }
     } else {
       // For outbound sockets we have no useful local address to expose. Inbound sockets (produced
       // by the `connect()` handler dispatch path) populate `localAddress` with the CONNECT
@@ -1826,6 +1897,23 @@ void Socket::handleReadableEof(jsg::Lock& js, jsg::Promise<void> onEof) {
           JSG_VISITABLE_LAMBDA(
               (ref = JSG_THIS), (ref), (jsg::Lock& js) { return ref->maybeCloseWriteSide(js); }))
       .markAsHandled(js);
+}
+
+void Socket::handleDatagramEof(jsg::Lock& js, kj::Promise<void> eof) {
+  // The reference must be weak, as in wireClosedToDisconnect(): the IoContext holds the wait, and a
+  // strong reference would keep the Socket, and with it the flow, alive until the peer ends it.
+  // A rejection means the readable was dropped before EOF.
+  IoContext::current()
+      .awaitIo(js, kj::mv(eof))
+      .then(js, [self = JSG_THIS_WEAK(js)](jsg::Lock& js) mutable -> jsg::Promise<void> {
+    KJ_IF_SOME(socket, self.tryAddRef(js)) {
+      return socket->maybeCloseWriteSide(js);
+    }
+
+    return js.resolvedPromise();
+  }, [](jsg::Lock& js, jsg::Value) {
+    return js.resolvedPromise();
+  }).markAsHandled(js);
 }
 
 jsg::Promise<void> Socket::maybeCloseWriteSide(jsg::Lock& js) {
